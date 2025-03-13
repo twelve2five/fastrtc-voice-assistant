@@ -1,0 +1,7 @@
+fastrtc
+gradio
+deepseek-ai
+elevenlabs
+python-dotenv
+gTTS
+numpy
