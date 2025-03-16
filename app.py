@@ -35,43 +35,8 @@ deepseek_client = DeepSeekAPI(api_key=os.getenv("DEEPSEEK_API_KEY"))
 # Add this debug code temporarily to see what methods are available:
 print(dir(deepseek_client))
 
-# Initialize CSM model
-def initialize_csm():
-    """Initialize the CSM text-to-speech model"""
-    print("Initializing CSM model...")
-    
-    # Login to Hugging Face if token is available
-    hf_token = os.getenv("HF_TOKEN")
-    if hf_token:
-        login(token=hf_token)
-    else:
-        print("Warning: HF_TOKEN not found in environment variables")
-        hf_token = input("Enter your Hugging Face token (needed for CSM model): ")
-        login(token=hf_token)
-    
-    # Download and set up CSM
-    try:
-        # Add CSM to Python path if not already there
-        if './csm' not in sys.path:
-            sys.path.append('./csm')
-        
-        # Download the model checkpoint
-        model_path = hf_hub_download(repo_id="sesame/csm-1b", filename="ckpt.pt")
-        print(f"CSM model downloaded to: {model_path}")
-        
-        # Import and load the model
-        from generator import load_csm_1b, Segment
-        generator = load_csm_1b(model_path, "cuda" if torch.cuda.is_available() else "cpu")
-        print("CSM model loaded successfully!")
-        
-        return generator
-    except Exception as e:
-        print(f"Error initializing CSM model: {e}")
-        print("Falling back to gTTS...")
-        return None
-
-# Try to initialize CSM once at startup
-csm_generator = initialize_csm()
+# Set CSM to None to skip that option
+csm_generator = None
 
 def response(
     audio: tuple[int, np.ndarray],
@@ -111,7 +76,7 @@ stream = Stream(
     additional_outputs_handler=lambda a, b: b,
     additional_inputs=[chatbot],
     additional_outputs=[chatbot],
-    ui_args={"title": "LLM Voice Chat (Powered by DeepSeek & CSM)"}
+    ui_args={"title": "LLM Voice Chat (Powered by DeepSeek & ElevenLabs)"}
 )
 
 # Create FastAPI app and mount stream
@@ -144,106 +109,126 @@ def get_deepseek_response(messages):
     response_json = response.json()
     return response_json["choices"][0]["message"]["content"]
 
-# Add CSM-based text_to_speech function
+# Helper function for gTTS
+def use_gtts_for_sentence(sentence):
+    """Helper function to generate speech with gTTS"""
+    try:
+        # Process each sentence separately
+        mp3_fp = io.BytesIO()
+        
+        # Force US English
+        print(f"Using gTTS with en-us locale for sentence: {sentence[:20]}...")
+        tts = gTTS(text=sentence, lang='en-us', tld='com', slow=False)
+        tts.write_to_fp(mp3_fp)
+        mp3_fp.seek(0)
+        
+        # Process audio data
+        data, samplerate = sf.read(mp3_fp)
+        
+        # Convert to mono if stereo
+        if len(data.shape) > 1 and data.shape[1] > 1:
+            data = data[:, 0]
+        
+        # Resample to 24000 Hz if needed
+        if samplerate != 24000:
+            data = np.interp(
+                np.linspace(0, len(data), int(len(data) * 24000 / samplerate)),
+                np.arange(len(data)),
+                data
+            )
+        
+        # Convert to 16-bit integers
+        data = (data * 32767).astype(np.int16)
+        
+        # Ensure buffer size is even
+        if len(data) % 2 != 0:
+            data = np.append(data, [0])
+        
+        # Reshape and yield in chunks
+        chunk_size = 4800
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i+chunk_size]
+            if len(chunk) > 0:
+                if len(chunk) % 2 != 0:
+                    chunk = np.append(chunk, [0])
+                chunk = chunk.reshape(1, -1)
+                yield (24000, chunk)
+    except Exception as e:
+        print(f"gTTS error: {e}")
+        yield None
+
+# Replace the text_to_speech function with this version
 def text_to_speech(text):
-    """Convert text to speech using CSM or gTTS as fallback"""
+    """Convert text to speech using ElevenLabs or gTTS as fallback"""
     try:
         # Split text into sentences for faster perceived response
         sentences = re.split(r'(?<=[.!?])\s+', text)
         
-        # Use CSM if available
-        if csm_generator is not None:
-            print("Using CSM for text-to-speech...")
+        # Try ElevenLabs first
+        if os.getenv("ELEVENLABS_API_KEY"):
+            print("Using ElevenLabs for text-to-speech...")
             
-            # Process each sentence separately for faster perception
             for sentence in sentences:
                 if not sentence.strip():
                     continue
                 
-                # Generate speech with CSM
-                print(f"Generating CSM speech for: {sentence[:30]}...")
-                audio = csm_generator.generate(
-                    text=sentence,
-                    speaker=0,  # Use speaker ID 0
-                    context=[],
-                    max_audio_length_ms=10_000,
-                )
-                
-                # Convert to numpy array
-                audio_np = audio.cpu().numpy()
-                
-                # Resample to 24000 Hz if needed (CSM uses 16000 Hz by default)
-                if csm_generator.sample_rate != 24000:
-                    audio_np = np.interp(
-                        np.linspace(0, len(audio_np), int(len(audio_np) * 24000 / csm_generator.sample_rate)),
-                        np.arange(len(audio_np)),
-                        audio_np
-                    )
-                
-                # Convert to 16-bit integers
-                audio_np = (audio_np * 32767).astype(np.int16)
-                
-                # Ensure buffer size is even
-                if len(audio_np) % 2 != 0:
-                    audio_np = np.append(audio_np, [0])
-                
-                # Reshape and yield in chunks
-                chunk_size = 4800
-                for i in range(0, len(audio_np), chunk_size):
-                    chunk = audio_np[i:i+chunk_size]
-                    if len(chunk) > 0:
-                        if len(chunk) % 2 != 0:
-                            chunk = np.append(chunk, [0])
-                        chunk = chunk.reshape(1, -1)
-                        yield (24000, chunk)
-                
-        else:
-            # Fall back to gTTS if CSM is not available
-            print("Falling back to gTTS...")
-            for sentence in sentences:
-                if not sentence.strip():
-                    continue
+                try:
+                    print(f"Generating ElevenLabs speech for: {sentence[:30]}...")
                     
-                # Process each sentence separately
-                mp3_fp = io.BytesIO()
-                
-                # Force US English
-                print(f"Using gTTS with en-us locale for sentence: {sentence[:20]}...")
-                tts = gTTS(text=sentence, lang='en-us', tld='com', slow=False)
-                tts.write_to_fp(mp3_fp)
-                mp3_fp.seek(0)
-                
-                # Process audio data
-                data, samplerate = sf.read(mp3_fp)
-                
-                # Convert to mono if stereo
-                if len(data.shape) > 1 and data.shape[1] > 1:
-                    data = data[:, 0]
-                
-                # Resample to 24000 Hz if needed
-                if samplerate != 24000:
-                    data = np.interp(
-                        np.linspace(0, len(data), int(len(data) * 24000 / samplerate)),
-                        np.arange(len(data)),
-                        data
+                    # Generate audio using ElevenLabs
+                    audio_data = elevenlabs_client.generate(
+                        text=sentence,
+                        voice="Antoni",  # You can change to any available voice
+                        model="eleven_monolingual_v1"
                     )
-                
-                # Convert to 16-bit integers
-                data = (data * 32767).astype(np.int16)
-                
-                # Ensure buffer size is even
-                if len(data) % 2 != 0:
-                    data = np.append(data, [0])
-                
-                # Reshape and yield in chunks
-                chunk_size = 4800
-                for i in range(0, len(data), chunk_size):
-                    chunk = data[i:i+chunk_size]
-                    if len(chunk) > 0:
-                        if len(chunk) % 2 != 0:
-                            chunk = np.append(chunk, [0])
-                        chunk = chunk.reshape(1, -1)
-                        yield (24000, chunk)
+                    
+                    # Convert to numpy array
+                    mp3_fp = io.BytesIO(audio_data)
+                    data, samplerate = sf.read(mp3_fp)
+                    
+                    # Convert to mono if stereo
+                    if len(data.shape) > 1 and data.shape[1] > 1:
+                        data = data[:, 0]
+                    
+                    # Resample to 24000 Hz if needed
+                    if samplerate != 24000:
+                        data = np.interp(
+                            np.linspace(0, len(data), int(len(data) * 24000 / samplerate)),
+                            np.arange(len(data)),
+                            data
+                        )
+                    
+                    # Convert to 16-bit integers
+                    data = (data * 32767).astype(np.int16)
+                    
+                    # Ensure buffer size is even
+                    if len(data) % 2 != 0:
+                        data = np.append(data, [0])
+                    
+                    # Reshape and yield in chunks
+                    chunk_size = 4800
+                    for i in range(0, len(data), chunk_size):
+                        chunk = data[i:i+chunk_size]
+                        if len(chunk) > 0:
+                            if len(chunk) % 2 != 0:
+                                chunk = np.append(chunk, [0])
+                            chunk = chunk.reshape(1, -1)
+                            yield (24000, chunk)
+                            
+                except Exception as e:
+                    print(f"ElevenLabs error: {e}, falling back to gTTS")
+                    # Fall through to gTTS for this sentence
+                    for audio_chunk in use_gtts_for_sentence(sentence):
+                        if audio_chunk:
+                            yield audio_chunk
+        else:
+            # Fall back to gTTS
+            print("ElevenLabs API key not found, using gTTS...")
+            for sentence in sentences:
+                if sentence.strip():
+                    for audio_chunk in use_gtts_for_sentence(sentence):
+                        if audio_chunk:
+                            yield audio_chunk
     except Exception as e:
         print(f"Exception in text_to_speech: {e}")
         yield None
